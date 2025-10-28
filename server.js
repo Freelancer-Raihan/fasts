@@ -16,7 +16,7 @@ const MOBILE_PREFIX = "016";
 const BATCH_SIZE = 500;
 const MAX_WORKERS = 500; 
 const TARGET_LOCATION = "http://fsmms.dgf.gov.bd/bn/step2/movementContractor/form";
-const OTP_ATTEMPT_TIMEOUT = 10000; 
+const OTP_ATTEMPT_TIMEOUT = 60000; 
 const BATCH_TOTAL_TIMEOUT = 60000; 
 
 // Enhanced headers from Python code
@@ -502,4 +502,5 @@ if (isMainThread) {
     app.listen(PORT, () => {
         console.log(`📍 Main endpoint: http://localhost:${PORT}/get-info?nid=8667082708&dob=1962-11-07`);
     });
+
 }
